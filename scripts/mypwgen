@@ -1,0 +1,302 @@
+#!perl -wT
+
+use strict;
+use warnings;
+use IO::Handle;
+use Getopt::Std;
+use Module::Load;
+use vars qw(%Chars %Opts $Random);
+
+our $VERSION = "1.0";
+
+%Opts = (
+	n => 8,
+	d => 2,
+	l => 2,
+	u => 2,
+	s => 0,
+	F => 0,
+	D => 0,
+	P => 0,
+	B => 0,
+    S => undef,
+);
+
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+sub HELP_MESSAGE {
+	my $out = shift;
+	print $out
+   		"\nUsage: $0 [OPTIONS]\n",
+		"\nGenerates passwords. Options are:\n",
+		"    -n N    Password length (default $Opts{n})\n",
+		"    -d D    Include at least D decimal digits (default $Opts{d})\n",
+		"    -l L    Include at least L lowercase chars (default $Opts{l})\n",
+		"    -u U    Include at least U uppercase chars (default $Opts{u})\n",
+		"    -s S    Include at least S special symbols (default $Opts{s})\n",
+		"    -F      \"Friendly\" mode (include exactly the specified number of special symbols)\n",
+		"    -D      Also print a hashed password version with random salt\n",
+		"    -P      Pipe mode (implies -D), password is read from stdin\n",
+		"    -B      Use /dev/random (default is /dev/urandom)\n",
+		"    -S id   Specifies hashing algorithm for -D. Default is 5 (SHA-256)\n",
+		;
+}
+
+{
+    getopts("n:d:l:u:s:FDPBS:", \%Opts);
+
+    # If -S is specified -D option is implied
+    if(defined $Opts{S}) {
+        $Opts{D} = 1;
+    } else {
+        $Opts{S} = 5;
+    }
+
+    # Compute and validate the password strength requirements
+    $Opts{f} = $Opts{n} - ($Opts{d} + $Opts{l} + $Opts{u} + $Opts{s});
+    die "Number of mandatory symbols exceeds overall password length" if $Opts{f} < 0;
+}
+
+
+%Chars = (
+	lcase  => ['a' .. 'z'],
+	ucase  => ['A' .. 'Z'],
+	digit  => ['0' .. '9'],
+	spec   => ['!', ',', '.', ';', '@', '-', '_', '"', '\''],
+);
+
+{
+    my $rng = $Opts{B} ? "/dev/random" : "/dev/urandom";
+    open $Random, "<", $rng
+        or die "Cannot open $rng: $!\n";
+}
+
+# Ensure 8-bit safety
+binmode $Random;
+
+# From random byte source generate $count random values from [0..$mod), compensating for modulo bias
+sub get_random_values {
+    my ($mod, $count) = @_;
+    my $rnd;
+
+    my @result = ();
+    my $rand_limit = 255 - 256 % $mod;
+
+    while($count--) {
+        # Get unbiased random value
+        do {
+            die "Cannot read random data" if $Random->read($rnd, 1) != 1;
+            $rnd = ord($rnd);
+        } while($rnd > $rand_limit);
+        push @result, $rnd % $mod;
+    }
+
+    return @result;
+}
+
+sub get_random {
+    my $mod = shift;
+    return (get_random_values($mod, 1))[0];
+}
+
+sub random_chars {
+	my ($n, @chars) = @_;
+
+	my @s = ();
+    for(get_random_values(scalar @chars, $n)) {
+		push @s, $chars[$_];
+	}
+	return @s;
+}
+
+sub generate_password {
+	my @Pass = ();
+
+    # Select mandatory number of random characters of each class
+	push @Pass, random_chars($Opts{d}, @{$Chars{digit}});
+	push @Pass, random_chars($Opts{l}, @{$Chars{lcase}});
+	push @Pass, random_chars($Opts{u}, @{$Chars{ucase}});
+	push @Pass, random_chars($Opts{s}, @{$Chars{spec}});
+
+    # Pad to the requested length...
+	if($Opts{F}) {
+        # ... with easy-to-remember characters only, if friendly mode is selected...
+		push @Pass, random_chars($Opts{f}, @{$Chars{digit}}, @{$Chars{lcase}}, @{$Chars{ucase}});
+	} else {
+        # ... or with all the characters from the set otherwise
+		push @Pass, random_chars($Opts{f}, @{$Chars{digit}}, @{$Chars{lcase}}, @{$Chars{ucase}}, @{$Chars{spec}});
+	}
+
+    # Now, shuffle @Pass using Fisher-Yates algorithm (taken from perlfaq4)
+    # Again, modulo bias compensation may be necessary
+    my $i = @Pass;
+    while(--$i) {
+        my $j = get_random($i + 1);
+
+        @Pass[$i, $j] = @Pass[$j, $i];
+    }
+
+    # Finally, make a string
+    return join("", @Pass);
+}
+
+sub hash_password {
+	my $Pass = shift;
+
+    my $Hash;
+
+    # Salt size of 16 seems compatible to all implementations
+    my $salt = join "", random_chars(16, 'a'..'z', 'A'..'Z', '.', '/');
+
+    if($Opts{S} eq 'S') {
+        # Generate salted SHA if requested
+        load Digest::SHA, 'sha1';
+        load MIME::Base64, 'encode_base64';
+
+        $Hash = "{SSHA}" . encode_base64(sha1($Pass . $salt) . $salt);
+
+        chomp $Hash; # encode_base64 adds a trailing newline
+    } else {
+        # Use system crypt()
+        # If '-S 0' is given - use traditional crypt() with 2-character salt, the rest is discarded
+        # Otherwise try to use modular crypt format, hoping that system crypt() supports it
+        if($Opts{S} ne '0') {
+            $salt = "\$$Opts{S}\$$salt";
+        }
+
+        $Hash = crypt($Pass, $salt);
+        unless(defined $Hash) {
+            # crypt() seems to return undef if the salt format is not recognized
+            warn "System crypt() didn't recognize $Opts{S} as password format id";
+            $Hash = "";
+        }
+    }
+
+    return $Hash;
+}
+
+if($Opts{P}) {
+	while(<STDIN>) {
+		chomp;
+		print hash_password($_) . "\n"; 
+	}
+} else {
+	my $Pass = generate_password();
+	print "$Pass\n";
+	print hash_password($Pass) . "\n" if $Opts{D};
+}
+
+__END__
+
+=head1 NAME
+
+mypwgen - random password generator
+
+=head1 SYNOPSIS
+
+mypwgen [options]
+
+
+=head1 DESCRIPTION
+
+Generates random passwords.
+
+Uses F</dev/[u]random> as strong pseudo-random numbers source, with modulo bias compensation where necessary. Selects the required number of decimal digits, lowercase and uppercase characters, and special symbols (S<!,.;@-_"\>), pads to the requested length and then shuffles the characters to get a reasonably good password meeting the requirements.
+
+There is also a special "friendly" mode to use only the required number of special characters, to simplify memorizing the password.
+
+In practice the passwords generated in this way are reasonably hard to guess and still reasonably easy to memorize, at least according to my personal experience.
+
+Optionally the script can output a password hash suitable for F</etc/shadow> (using system C<crypt()> function) or for Nginx/Dovecot password files (salted Base64-encoded SHA-1 digest, C<{SSHA}...>, using C<Digest::SHA> and C<MIME::Base64> modules).
+
+=head1 OPTIONS
+
+The following options specify password strength requirements. The defaults are based on personal experience and designed to meet most of the password policies I've encountered.
+
+=over 8
+
+=item B<-n N>
+
+Specifies overall password length. The default is 8 which is reasonable for random passwords - i.e., not based on dictionary words and phone numbers.
+
+=item B<-d D>
+
+Use at least D decimal digits in the password. The default is 2.
+
+=item B<-l L>
+
+Use at least L lowercase letters. The default is 2.
+
+=item B<-u U>
+
+Use at least U uppercase chars. The default is 2.
+
+=item B<-s S>
+
+Use at least S special characters. The default is 0.
+
+=item B<-F>
+
+"Friendly" mode - don't use more special characters than requested by B<-s> option. Excessive use of punctuation makes passwords difficult to remember with questionable benefit, and many existing password generators tend to overuse weird characters which lead me to creating one of my own.
+
+=back
+
+The following options configure password hash output:
+
+=over 8
+
+=item B<-D>
+
+Prints password hash.
+
+=item B<-S id>
+
+Specifies hashing algorithm. By default the value is passed as-is to system C<crypt()> in C<salt> parameter like C<"$id$salt"> (hence the option name) complying to modular crypt format, with a few exceptions treated specially. The default format is 5 which designates SHA-256 hashing algorithm supported by most modern systems. If system C<crypt()> doesn't recognize the format a warning is issued.
+
+Random 16-character salt is generated, however some hashing algorithm may use only 8 (MD5) or even 2 (traditional DES) characters.
+
+The following "special" salt values are treated differently:
+
+=over 4
+
+=item I<0>
+
+Traditional DES-based C<crypt()> is used, with no modular format and two-character salt.
+
+=item I<S>
+
+Salted Base64-encoded SHA-1 hash is computed, suitable for Nginx/Dovecot password files.
+
+=back
+
+Check C<man crypt> for list of the format identifiers supported by your system.
+
+Specifying B<-S> option also implies B<-D>.
+
+=back
+
+Other options are:
+
+=over 8
+
+=item B<-P>
+
+Pipe mode, useful for obtaining password hashes for existing passwords. Passwords are read from standard input, random salt is generated and the hash generated according to B<-S> option are printed.
+
+=item B<-B>
+
+Use blocking F</dev/random> instead of the default F</dev/urandom> as random numbers source.
+
+A common belief is that this device presumably gives "better" random numbers which is not exactly true. The blocking nature of F</dev/random> makes password generation slow on many systems, and it takes too much time to generate ten or twenty passwords with no observable benefit, but the option is left here for strong believers.
+
+=back
+
+=head1 NOTEs and TODOs
+
+Developed on Slackware64 14.0+, should be compatible with Perl 5.10.0+ or even older. Tested and used at CentOS 6, also may work on BSD systems (not sure about their C<crypt()> though).
+
+C<Digest::SHA> and C<MIME::Base64> modules are optional and not loaded unless B<-S S> is given.
+
+=head1 AUTHOR
+
+Jeff MacLoue <jeff@macloue.com>
+
