@@ -79,4 +79,4 @@ rotate the passwords on a regular basis at all times.
 References
 ==========
 
-.. _Myths about /dev/urandom: https://www.2uo.de/myths-about-urandom/
+Myths about /dev/urandom: https://www.2uo.de/myths-about-urandom/
